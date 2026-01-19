@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-template <class K, class Hash, class Eq = std::equal_to<K>>
+template <class K, class Hash = std::hash<K>, class Eq = std::equal_to<K>>
 concept HashableKey =
     std::regular<K> &&
     std::predicate<Eq, const K&, const K&> &&
@@ -27,29 +27,32 @@ struct Shard {
     using It   = typename List::iterator;
 
     std::mutex mtx;
-    std::unordered_map<K, It, Hash, Eq> map; // key -> iterator into lru
+    std::unordered_map<K, It, Hash, Eq> map;  // key -> iterator into lru
     List lru;                                 // front = MRU, back = LRU
     std::size_t capacity = 0;
 };
 
-template<class K, class V, std::size_t Capacity,
+template<class K, class V, std::size_t capacity,
          class Hash = std::hash<K>, class Eq = std::equal_to<K>>
 requires HashableKey<K, Hash, Eq> && StorableValue<V>
 class LRUCache {
 public:
-    static_assert(Capacity > 0);
+    static_assert(capacity > 0, "Cache must be initialized with a postiive capacity");
 
     LRUCache() {
         // shard.resize(1);
-        shard.capacity = Capacity;
+        shard.capacity = capacity;
     }
 
     bool get(const K& k, V& out) {
         auto& s = shard;
         // std::scoped_lock lock(s.mtx); // enable when you care about threads
 
+        if (!contains(k)) {
+            return false;
+        }
+    
         auto it = s.map.find(k);
-        if (it == s.map.end()) { return false; }
 
         // move node to front (MRU)
         s.lru.splice(s.lru.begin(), s.lru, it->second);
@@ -63,7 +66,7 @@ public:
         auto& s = shard;
         // std::scoped_lock lock(s.mtx);
 
-        if (auto it = s.map.find(k); it != s.map.end()) {
+        if (!contains(k)) {
             return false;
         }
 
@@ -101,13 +104,25 @@ public:
         s.map.erase(it);
     }
 
-    void clear() {
+    void clear(std::optional<size_t> shard_num) {
+
+        // if shard is not given, clear every shard
+        // else only clear the given shard
         auto& s = shard;
         // std::scoped_lock lock(s.mtx);
         s.map.clear();
         s.lru.clear();
     }
 
+    void resize(std::size_t size) {
+
+    }
+
 private:
     Shard<K, V, Hash, Eq> shard;
+    std::size_t shard_count = 0;
+
+    std::size_t get_shard(const K& k) const {
+        size_t idx = std::hash<K>{}(k) % shard_count;
+    }
 };

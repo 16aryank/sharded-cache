@@ -35,9 +35,41 @@ TEST(CacheTest, HandlesHashableKey) {
         EXPECT_TRUE(cache.get({1}, out));
         EXPECT_EQ(out, 111);
     }
-    std::cout << "...Passed\n";
 }
 
-TEST(CacheTest, HandlesMoveableKey) {
+TEST(CacheTest, HandlesMoveableValues) {
+    // ensure movable values work
+}
 
+TEST(CacheTest, HandlesEviction) {
+    LRUCache<int, int, 5> cache;
+    EXPECT_EQ(cache.size(), std::size_t{0});
+    int out = 0;
+    
+    // cache is at capacity
+    for (std::size_t i = 0; i < 5; i++) {
+        EXPECT_TRUE(cache.put(i, i * 100));
+        EXPECT_FALSE(cache.put(i, i * 100));
+        EXPECT_TRUE(cache.get(i, out));
+        EXPECT_EQ(cache.size(), i + 1);
+    }
+
+    for (std::size_t i = 0; i < 5; i++) {
+        EXPECT_TRUE(cache.contains(0));
+    }
+
+    // evict Key 0 
+    EXPECT_TRUE(cache.put(6, 600));
+    EXPECT_FALSE(cache.get(0, out));
+
+    EXPECT_EQ(cache.size(), std::size_t{5});
+}
+
+TEST(CacheTest, HandlesBasic) {
+    LRUCache<int, int, 0> cache;
+    // put when at capacity
+    // put when it's already there
+    // test erase when empty
+    // test erase when full
+    // test contains
 }
