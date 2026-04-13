@@ -1,6 +1,15 @@
+GTEST_PREFIX := $(shell brew --prefix googletest)
+GTEST_INC    := -I$(GTEST_PREFIX)/include
+GTEST_LIBDIR := -L$(GTEST_PREFIX)/lib
+GTEST_LIBS   := -lgtest -lgtest_main -pthread
+
 CXX ?= c++
-CXXFLAGS ?= -std=c++20 -Wall -Wextra -Werror -pedantic -O2 -g -I/opt/homebrew/include
-INCLUDES := -Iinclude
+CXXFLAGS ?= -std=c++20 -Wall -Wextra -Werror -pedantic -fsanitize=address -fsanitize=undefined -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG -O2 -g
+INCLUDES := -Iinclude $(GTEST_INC)
+
+LDFLAGS  := $(GTEST_LIBDIR)
+LDLIBS   := $(GTEST_LIBS)
+
 BUILD_DIR ?= build
 
 LIB_SRC := $(wildcard src/*.cpp)
@@ -15,7 +24,7 @@ ifneq ($(strip $(LIB_OBJ)),)
 LIB_LINK := $(LIB_AR)
 endif
 
-.PHONY: all lib tests clean
+.PHONY: all lib tests clean single_threaded multi_threaded
 
 all: lib tests
 
@@ -43,7 +52,13 @@ endif
 
 $(BUILD_DIR)/tests/%: tests/%.cpp $(LIB_LINK)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@ $(LIB_LINK)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@ $(LIB_LINK) $(LDFLAGS) $(LDLIBS)
+
+single_threaded: $(BUILD_DIR)/tests/single_threaded
+	$(BUILD_DIR)/tests/single_threaded
+
+multi_threaded: $(BUILD_DIR)/tests/multi_threaded
+	$(BUILD_DIR)/tests/multi_threaded
 
 clean:
 	rm -rf $(BUILD_DIR)

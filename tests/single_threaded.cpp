@@ -1,5 +1,8 @@
 #include "../src/cache.h"
 #include "gtest/gtest.h"
+#include <string>
+#include <random>
+#include <set>
 
 TEST(CacheTest, HandlesHashableKey) {
     // Hashable key works
@@ -26,7 +29,8 @@ TEST(CacheTest, HandlesHashableKey) {
                 return std::hash<int>{}(k.x);
             }
         };
-        LRUCache<MyKey, int, 2, MyKeyHash> cache;
+
+        LRUCache<MyKey, int, 2, 1, MyKeyHash> cache;
 
         EXPECT_TRUE(cache.put({1}, 111));
         EXPECT_TRUE(cache.put({2}, 222));
@@ -38,12 +42,20 @@ TEST(CacheTest, HandlesHashableKey) {
 }
 
 TEST(CacheTest, HandlesMoveableValues) {
-    // ensure movable values work
+    struct NonMovableClass {
+        NonMovableClass& operator=(NonMovableClass&&) = delete;
+        int x;
+    };
+    struct MovableClass {
+        int x;
+    };
+    static_assert(!StorableValue<NonMovableClass>);
+    static_assert(StorableValue<MovableClass>);
+    EXPECT_TRUE(true);
 }
 
 TEST(CacheTest, HandlesEviction) {
-    LRUCache<int, int, 5> cache;
-    EXPECT_EQ(cache.size(), std::size_t{0});
+    LRUCache<int, int, 5, 1> cache;
     int out = 0;
     
     // cache is at capacity
@@ -51,7 +63,6 @@ TEST(CacheTest, HandlesEviction) {
         EXPECT_TRUE(cache.put(i, i * 100));
         EXPECT_FALSE(cache.put(i, i * 100));
         EXPECT_TRUE(cache.get(i, out));
-        EXPECT_EQ(cache.size(), i + 1);
     }
 
     for (std::size_t i = 0; i < 5; i++) {
@@ -61,15 +72,85 @@ TEST(CacheTest, HandlesEviction) {
     // evict Key 0 
     EXPECT_TRUE(cache.put(6, 600));
     EXPECT_FALSE(cache.get(0, out));
-
-    EXPECT_EQ(cache.size(), std::size_t{5});
 }
 
-TEST(CacheTest, HandlesBasic) {
-    LRUCache<int, int, 0> cache;
-    // put when at capacity
-    // put when it's already there
-    // test erase when empty
-    // test erase when full
-    // test contains
+TEST(CacheTest, HandlesRandom) {
+    LRUCache<int, int, 100, 5> cache;
+    EXPECT_NO_THROW(cache.erase(0));
+    cache.put(0, 0);
+
+    std::mt19937 engine(12345); // fixed seed
+    std::uniform_int_distribution<int> dist(1, 10000000);
+    std::set<size_t> shards;
+
+    while(cache.size_shard(0) < cache.get_capacity()) {
+        const auto& rand = dist(engine);
+        cache.put(rand, 0);
+        shards.insert(std::hash<int>{}(rand) % 5); // defaults to std::hash
+    }
+    
+    // test consistent hashing
+    EXPECT_TRUE(shards.size() == 5);
+
+    // test get/put
+    int out = -1;
+    EXPECT_TRUE(cache.contains(0));
+    EXPECT_TRUE(cache.get(0, out));
+    EXPECT_TRUE(out == 0);
+    
+    EXPECT_FALSE(cache.put(0, -1));
+    EXPECT_TRUE(cache.get(0, out));
+    EXPECT_TRUE(out == -1);
+
+    // test put updates LRU
+    bool found = false;
+    int found_value = -1;
+    while (!found) {
+        const auto& rand = dist(engine);
+        if ((std::hash<int>{}(rand) % 5) == 0) {
+            found = true;
+            found_value = rand;
+        }
+    }
+    cache.put(found_value, 0);
+    EXPECT_TRUE(cache.contains(0));
+
+    // test erase
+    cache.erase(0);
+    EXPECT_FALSE(cache.contains(0));
+}
+
+TEST(CacheTest, HandlesClear) {
+    LRUCache<int, int, 2, 2> cache;
+    bool found = false;
+    int zero_val; 
+    int one_val;
+
+    std::mt19937 engine(12345); // fixed seed
+    std::uniform_int_distribution<int> dist(1, 10000000);
+
+    // append to shard 0
+    while (!found) {
+        const auto& rand = dist(engine);
+        if (std::hash<int>{}(rand) % 2 == 0) {
+            found = true;
+            cache.put(rand, 0);
+            zero_val = rand;
+        }
+    }
+
+    // append to shard 1
+    found = false;
+    while (!found) {
+        const auto& rand = dist(engine);
+        if (std::hash<int>{}(rand) % 2 == 1) {
+            found = true;
+            cache.put(rand, 0);
+            one_val = rand;
+        }
+    }
+
+    cache.clear(one_val);
+    EXPECT_TRUE(cache.size_shard(one_val) == 0);
+    EXPECT_TRUE(cache.size_shard(zero_val) == 1);
 }

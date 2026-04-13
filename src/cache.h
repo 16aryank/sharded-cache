@@ -1,61 +1,56 @@
 #pragma once
 
+#include "shard.h"
 #include <concepts>
 #include <functional>
+#include <future>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <stdexcept>
+#include <iostream>
 
 template <class K, class Hash = std::hash<K>, class Eq = std::equal_to<K>>
 concept HashableKey =
     std::regular<K> &&
     std::predicate<Eq, const K&, const K&> &&
-    requires(Hash h, const K& k) {
+    requires(const Hash& h, const K& k) {
         { h(k) } -> std::convertible_to<std::size_t>;
     };
 
 template <class Val>
-concept StorableValue = std::movable<Val>;
+concept StorableValue = std::copyable<Val>;
 
-template <class K, class Val,
-          class Hash = std::hash<K>,
-          class Eq   = std::equal_to<K>>
-struct Shard {
-    using List = std::list<std::pair<K, Val>>;
-    using It   = typename List::iterator;
-
-    std::mutex mtx;
-    std::unordered_map<K, It, Hash, Eq> map;  // key -> iterator into lru
-    List lru;                                 // front = MRU, back = LRU
-    std::size_t capacity = 0;
-};
-
-template<class K, class V, std::size_t capacity,
+template<class K, class V, std::size_t capacity, std::size_t num_shards = 1,
          class Hash = std::hash<K>, class Eq = std::equal_to<K>>
 requires HashableKey<K, Hash, Eq> && StorableValue<V>
 class LRUCache {
 public:
-    static_assert(capacity > 0, "Cache must be initialized with a postiive capacity");
+    
+    static_assert(capacity > 0, "Cache capacity must be positive");
+    static_assert(num_shards > 0, "Number of shards must be positive");
 
-    LRUCache() {
-        // shard.resize(1);
-        shard.capacity = capacity;
+    LRUCache() : _capacity(capacity) {
+        _shards.resize(num_shards);
+        for (auto& shard : _shards) {
+            shard = std::make_unique<Shard<K, V, Hash, Eq>>();
+        }
     }
 
     bool get(const K& k, V& out) {
-        auto& s = shard;
-        // std::scoped_lock lock(s.mtx); // enable when you care about threads
+        auto& s = *_shards[get_shard(k)];
+        std::scoped_lock lock(s._mtx);
 
-        if (!contains(k)) {
+        auto it = s._map.find(k);
+        if (it == s._map.end()) {
             return false;
         }
-    
-        auto it = s.map.find(k);
 
         // move node to front (MRU)
-        s.lru.splice(s.lru.begin(), s.lru, it->second);
+        s._lru.splice(s._lru.begin(), s._lru, it->second);
 
         out = it->second->second; // value
         return true;
@@ -63,66 +58,154 @@ public:
 
     // Returns false if key already exists
     bool put(const K& k, V v) {
-        auto& s = shard;
-        // std::scoped_lock lock(s.mtx);
+        auto& s = *_shards[get_shard(k)];
+        std::scoped_lock lock(s._mtx);
 
-        if (!contains(k)) {
+        // update pointers
+        auto it = s._map.find(k);
+        if (it != s._map.end()) {
+            s._lru.splice(s._lru.begin(), s._lru, it->second);
+            it->second->second = std::move(v);
             return false;
         }
 
-        s.lru.emplace_front(k, std::move(v));
-        s.map.emplace(s.lru.front().first, s.lru.begin());
+        s._lru.emplace_front(k, std::move(v));
+        s._map.emplace(s._lru.front().first, s._lru.begin());
 
         // evict if over capacity
-        if (s.map.size() > s.capacity) {
-            const K& victim_key = s.lru.back().first;
-            s.map.erase(victim_key);
-            s.lru.pop_back();
+        if (s._map.size() > _capacity) {
+            const K& victim_key = s._lru.back().first;
+            s._map.erase(victim_key);
+            s._lru.pop_back();
         }
         return true;
     }
 
     bool contains(const K& k) const {
-        auto& s = shard;
-        // std::scoped_lock lock(s.mtx);
-        return s.map.find(k) != s.map.end();
-    }
-
-    std::size_t size() const {
-        auto& s = shard;
-        // std::scoped_lock lock(s.mtx);
-        return s.map.size();
+        auto& s = *_shards[get_shard(k)];
+        std::scoped_lock lock(s._mtx);
+        return s._map.find(k) != s._map.end();
     }
 
     void erase(const K& k) {
-        auto& s = shard;
-        // std::scoped_lock lock(s.mtx);
+        auto& s = *_shards[get_shard(k)];
+        std::scoped_lock lock(s._mtx);
 
-        auto it = s.map.find(k);
-        if (it == s.map.end()) { return; }
-        s.lru.erase(it->second);
-        s.map.erase(it);
+        auto it = s._map.find(k);
+        if (it == s._map.end()) {
+            return; 
+        }
+        s._lru.erase(it->second);
+        s._map.erase(it);
     }
 
-    void clear(std::optional<size_t> shard_num) {
-
-        // if shard is not given, clear every shard
-        // else only clear the given shard
-        auto& s = shard;
-        // std::scoped_lock lock(s.mtx);
-        s.map.clear();
-        s.lru.clear();
+    // Clears only the shard that would contain key k.
+    void clear_shard(const K& k) {
+        auto& s = *_shards[get_shard(k)];
+        std::scoped_lock lock(s._mtx);
+        s._map.clear();
+        s._lru.clear();
     }
 
-    void resize(std::size_t size) {
+    // Backwards-compatible alias for shard-level clear.
+    void clear(const K& k) { clear_shard(k); }
 
+    // Clears all shards (entire cache).
+    void clear_all() {
+        for (auto& shard : _shards) {
+            std::scoped_lock lock(shard->_mtx);
+            shard->_map.clear();
+            shard->_lru.clear();
+        }
+    }
+
+    // Size of the shard that would contain key k.
+    std::size_t size_shard(const K& k) const {
+        auto& s = *_shards[get_shard(k)];
+        std::scoped_lock lock(s._mtx);
+        return s._map.size();
+    }
+
+    // Per-shard capacity (not global capacity).
+    std::size_t capacity_per_shard() const noexcept {
+        return _capacity;
+    }
+
+    // Backwards-compatible alias for per-shard capacity.
+    std::size_t get_capacity() const noexcept { return capacity_per_shard(); }
+
+    std::size_t shard_count() const noexcept { return _shards.size(); }
+
+    template <class F>
+    std::shared_future<V> get_or_compute(const K& key, F&& fn) {
+        auto& s = *_shards[get_shard(key)];
+        std::shared_future<V> fut;
+        std::promise<V> p;
+
+        {
+            std::unique_lock<std::mutex> lock(s._mtx);
+
+            auto it = s._map.find(key);
+            if (it != s._map.end()) {
+                // move node to front (MRU)
+                s._lru.splice(s._lru.begin(), s._lru, it->second);
+                std::promise<V> ready;
+                auto ready_fut = ready.get_future().share();
+                ready.set_value(it->second->second);
+                return ready_fut;
+            }
+
+            auto inflight_it = s.inflight.find(key);
+            if (inflight_it != s.inflight.end()) {
+                fut = inflight_it->second;
+                return fut;
+            }
+
+            fut = p.get_future().share();
+            s.inflight.emplace(key, fut);
+        }
+
+        try {
+            V v = fn();
+
+            {
+                std::unique_lock<std::mutex> lock(s._mtx);
+                auto it = s._map.find(key);
+                if (it != s._map.end()) {
+                    s._lru.splice(s._lru.begin(), s._lru, it->second);
+                    it->second->second = v;
+                } else {
+                    s._lru.emplace_front(key, v);
+                    s._map.emplace(s._lru.front().first, s._lru.begin());
+
+                    if (s._map.size() > _capacity) {
+                        const K& victim_key = s._lru.back().first;
+                        s._map.erase(victim_key);
+                        s._lru.pop_back();
+                    }
+                }
+                s.inflight.erase(key);
+            }
+
+            p.set_value(v);
+            return fut;
+        } catch (...) {
+            {
+                std::unique_lock<std::mutex> lock(s._mtx);
+                s.inflight.erase(key);
+            }
+            p.set_exception(std::current_exception());
+            throw;
+        }
     }
 
 private:
-    Shard<K, V, Hash, Eq> shard;
-    std::size_t shard_count = 0;
+    std::vector<std::unique_ptr<Shard<K, V, Hash, Eq>>> _shards;
+    std::size_t _capacity;
+
+    Hash _hasher;
 
     std::size_t get_shard(const K& k) const {
-        size_t idx = std::hash<K>{}(k) % shard_count;
+        return _hasher(k) % _shards.size();
     }
 };
